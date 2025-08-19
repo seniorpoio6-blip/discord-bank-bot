@@ -1,0 +1,246 @@
+import asyncio
+import time
+from typing import Optional
+
+import aiosqlite
+import discord
+from discord import app_commands
+from discord.ext import commands
+
+# =========================
+# CONFIG
+# =========================
+TOKEN = "PON_AQUI_TU_TOKEN"  # <-- Cambia esto
+GUILD_IDS = None             # opcional: [123456789012345678] para registrar comandos más rápido en un servidor concreto
+
+INTENTS = discord.Intents.default()
+INTENTS.guilds = True
+INTENTS.members = True  # para autocompletados/mentions, etc.
+
+DB_PATH = "bank.sqlite3"
+
+# =========================
+# DB helpers
+# =========================
+CREATE_SQL = """
+PRAGMA journal_mode=WAL;
+CREATE TABLE IF NOT EXISTS accounts (
+  user_id INTEGER PRIMARY KEY,
+  balance INTEGER NOT NULL DEFAULT 0,
+  tier TEXT NOT NULL DEFAULT 'T1',
+  rank TEXT NOT NULL DEFAULT 'Bronze',
+  last_interest INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS rates (
+  kind TEXT NOT NULL,         -- 'tier' o 'rank'
+  name TEXT NOT NULL,         -- ej. 'T1', 'Bronze'
+  percent REAL NOT NULL,      -- 0..100
+  PRIMARY KEY (kind, name)
+);
+"""
+
+async def init_db():
+    async with aiosqlite.connect(DB_PATH) as db:
+        # Ejecuta múltiples sentencias
+        for stmt in CREATE_SQL.strip().split(";\n\n"):
+            if stmt.strip():
+                await db.execute(stmt)
+        await db.commit()
+
+async def ensure_account(user_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT user_id FROM accounts WHERE user_id=?", (user_id,))
+        row = await cur.fetchone()
+        if not row:
+            await db.execute("INSERT INTO accounts (user_id) VALUES (?)", (user_id,))
+            await db.commit()
+
+async def get_account(user_id: int):
+    await ensure_account(user_id)
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "SELECT user_id, balance, tier, rank, last_interest FROM accounts WHERE user_id=?",
+            (user_id,),
+        )
+        row = await cur.fetchone()
+        return {
+            "user_id": row[0],
+            "balance": row[1],
+            "tier": row[2],
+            "rank": row[3],
+            "last_interest": row[4],
+        }
+
+async def set_account_field(user_id: int, field: str, value):
+    await ensure_account(user_id)
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(f"UPDATE accounts SET {field}=? WHERE user_id=?", (value, user_id))
+        await db.commit()
+
+async def increment_balance(user_id: int, delta: int):
+    await ensure_account(user_id)
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE accounts SET balance = balance + ? WHERE user_id=?", (delta, user_id))
+        await db.commit()
+
+async def get_rate(kind: str, name: str) -> float:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT percent FROM rates WHERE kind=? AND name=?", (kind, name))
+        row = await cur.fetchone()
+        return float(row[0]) if row else 0.0
+
+async def set_rate(kind: str, name: str, percent: float):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO rates(kind,name,percent) VALUES(?,?,?) "
+            "ON CONFLICT(kind,name) DO UPDATE SET percent=excluded.percent",
+            (kind, name, percent),
+        )
+        await db.commit()
+
+# =========================
+# BOT
+# =========================
+class Bank(commands.Bot):
+    def __init__(self):
+        super().__init__(command_prefix="!", intents=INTENTS)
+        self.tree = app_commands.CommandTree(self)
+
+    async def setup_hook(self):
+        await init_db()
+        # Si quieres registrar los comandos en servidores concretos para que aparezcan al instante,
+        # pasa GUILD_IDS arriba. Si no, se registran globalmente (tarda unos minutos la primera vez).
+        if GUILD_IDS:
+            for gid in GUILD_IDS:
+                self.tree.copy_global_to(guild=discord.Object(id=gid))
+                await self.tree.sync(guild=discord.Object(id=gid))
+        else:
+            await self.tree.sync()
+
+bot = Bank()
+
+# =========================
+# /checkbalance
+# =========================
+@bot.tree.command(description="Muestra el balance de un usuario (por defecto tú).")
+@app_commands.describe(user="Usuario a consultar (opcional)")
+async def checkbalance(interaction: discord.Interaction, user: Optional[discord.User] = None):
+    target = user or interaction.user
+    acct = await get_account(target.id)
+    await interaction.response.send_message(
+        f"💰 Balance de **{target.mention}**: **{acct['balance']}** créditos "
+        f"(Tier: {acct['tier']}, Rank: {acct['rank']})",
+        ephemeral=True
+    )
+
+# =========================
+# /bank (grupo)
+# =========================
+bank = app_commands.Group(name="bank", description="Comandos del banco")
+bot.tree.add_command(bank)
+
+# --- add ---
+@bank.command(name="add", description="Añade créditos a un usuario (Manage Server).")
+@app_commands.checks.has_permissions(manage_guild=True)
+@app_commands.describe(user="Usuario", amount="Cantidad (entero, puede ser negativo para quitar)")
+async def bank_add(interaction: discord.Interaction, user: discord.User, amount: int):
+    await increment_balance(user.id, amount)
+    new_bal = (await get_account(user.id))["balance"]
+    await interaction.response.send_message(
+        f"✅ Saldo actualizado para {user.mention}. Cambio: {amount:+d}. Nuevo balance: **{new_bal}**",
+        ephemeral=True
+    )
+
+# --- remove ---
+@bank.command(name="remove", description="Quita créditos a un usuario (Manage Server).")
+@app_commands.checks.has_permissions(manage_guild=True)
+@app_commands.describe(user="Usuario", amount="Cantidad a quitar (entero positivo)")
+async def bank_remove(interaction: discord.Interaction, user: discord.User, amount: int):
+    await increment_balance(user.id, -abs(amount))
+    new_bal = (await get_account(user.id))["balance"]
+    await interaction.response.send_message(
+        f"🧾 Removidos **{amount}** créditos a {user.mention}. Nuevo balance: **{new_bal}**",
+        ephemeral=True
+    )
+
+# --- set tier/rank ---
+@bank.command(name="set_tier", description="Define el tier de un usuario (Manage Server).")
+@app_commands.checks.has_permissions(manage_guild=True)
+@app_commands.describe(user="Usuario", tier="Nombre del tier (ej. T1, T2, T3, ...)")
+async def bank_set_tier(interaction: discord.Interaction, user: discord.User, tier: str):
+    await set_account_field(user.id, "tier", tier)
+    await interaction.response.send_message(f"✅ Tier de {user.mention} establecido a **{tier}**.", ephemeral=True)
+
+@bank.command(name="set_rank", description="Define el rank de un usuario (Manage Server).")
+@app_commands.checks.has_permissions(manage_guild=True)
+@app_commands.describe(user="Usuario", rank="Nombre del rank (ej. Bronze, Silver, Gold, ...)")
+async def bank_set_rank(interaction: discord.Interaction, user: discord.User, rank: str):
+    await set_account_field(user.id, "rank", rank)
+    await interaction.response.send_message(f"✅ Rank de {user.mention} establecido a **{rank}**.", ephemeral=True)
+
+# --- setrate (tier o rank) ---
+setrate = app_commands.Group(name="setrate", description="Define % de interés por tier o rank", parent=bank)
+
+@setrate.command(name="tier", description="Define el % de interés para un tier (Manage Server).")
+@app_commands.checks.has_permissions(manage_guild=True)
+@app_commands.describe(name="Nombre del tier (ej. T1)", percent="Porcentaje (ej. 1.5 = 1.5%)")
+async def setrate_tier(interaction: discord.Interaction, name: str, percent: float):
+    await set_rate("tier", name, percent)
+    await interaction.response.send_message(f"✅ Interés de **tier {name}** establecido a **{percent}%**.", ephemeral=True)
+
+@setrate.command(name="rank", description="Define el % de interés para un rank (Manage Server).")
+@app_commands.checks.has_permissions(manage_guild=True)
+@app_commands.describe(name="Nombre del rank (ej. Bronze)", percent="Porcentaje (ej. 2 = 2%)")
+async def setrate_rank(interaction: discord.Interaction, name: str, percent: float):
+    await set_rate("rank", name, percent)
+    await interaction.response.send_message(f"✅ Interés de **rank {name}** establecido a **{percent}%**.", ephemeral=True)
+
+# --- interest claim (semanal) ---
+interest = app_commands.Group(name="interest", description="Intereses del banco", parent=bank)
+
+@interest.command(name="claim", description="Reclama tus intereses (una vez cada 7 días).")
+async def interest_claim(interaction: discord.Interaction):
+    user = interaction.user
+    acct = await get_account(user.id)
+
+    now = int(time.time())
+    week = 7 * 24 * 60 * 60
+    if acct["last_interest"] and now - acct["last_interest"] < week:
+        remaining = week - (now - acct["last_interest"])
+        hours = remaining // 3600
+        minutes = (remaining % 3600) // 60
+        return await interaction.response.send_message(
+            f"⏳ Ya reclamaste. Vuelve en **{hours}h {minutes}m**.", ephemeral=True
+        )
+
+    # Suma de rates por tier + rank
+    tier_rate = await get_rate("tier", acct["tier"])
+    rank_rate = await get_rate("rank", acct["rank"])
+    total_rate = tier_rate + rank_rate
+
+    interest_amt = int((acct["balance"] * total_rate) / 100.0)
+    if interest_amt <= 0:
+        await set_account_field(user.id, "last_interest", now)
+        return await interaction.response.send_message(
+            f"ℹ️ Tu interés actual es 0 (balance o rates demasiado bajos). "
+            f"(Tier {acct['tier']} {tier_rate}%, Rank {acct['rank']} {rank_rate}%)",
+            ephemeral=True
+        )
+
+    await increment_balance(user.id, interest_amt)
+    await set_account_field(user.id, "last_interest", now)
+    new_bal = (await get_account(user.id))["balance"]
+
+    await interaction.response.send_message(
+        f"🎉 Interés reclamado: **+{interest_amt}** "
+        f"(Tier {acct['tier']} {tier_rate}%, Rank {acct['rank']} {rank_rate}%, Total {total_rate}%).\n"
+        f"💰 Nuevo balance: **{new_bal}**",
+        ephemeral=True
+    )
+
+# =========================
+# ARRANQUE
+# =========================
+if __name__ == "__main__":
+    bot.run(TOKEN)     
